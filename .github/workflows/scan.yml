@@ -1,9 +1,6 @@
 name: Multi-Protocol Proxy Scanner (Runner Engine)
 
 on:
-  schedule:
-    # 每月 1 号 00:00 自动运行一次保活巡检 (主要为手动触发)
-    - cron: '0 0 1 * *'
   workflow_dispatch:
     inputs:
       shards_preset:
@@ -88,7 +85,6 @@ permissions:
   actions: write
 
 jobs:
-  # 阶段 1: 动态分片计算
   generate-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -127,7 +123,6 @@ jobs:
               f.write(f"total_shards={shards}\n")
           EOF
 
-  # 阶段 2: 目标智能展开 (支持跨仓获取或本地获取 ip.txt，并支持公开源聚合)
   expand:
     needs: generate-matrix
     runs-on: ubuntu-latest
@@ -185,7 +180,6 @@ jobs:
           else:
               raw_ports = preset.split()[0]
 
-          # 解析端口 (支持逗号、单个端口、以及范围格式如 1-65535 或 8000-8080)
           ports = []
           for token in raw_ports.replace("，", ",").split(","):
               token = token.strip()
@@ -227,7 +221,6 @@ jobs:
                           if not line or line.startswith("#"):
                               continue
 
-                          # 0. 支持用户直接输入带端口的目标 (如 1.2.3.4:443、https://1.2.3.4:8080 等)
                           clean_target = line
                           if "://" in clean_target:
                               clean_target = clean_target.split("://", 1)[1]
@@ -245,7 +238,6 @@ jobs:
                                   print(f"✅ Line {line_num}: {line} (Direct target with port)")
                                   continue
 
-                          # 1. 支持 IP 范围语法 (如 1.2.3.0-1.2.3.255)
                           if "-" in line:
                               parts = [p.strip() for p in line.split("-") if p.strip()]
                               if len(parts) == 2:
@@ -280,7 +272,6 @@ jobs:
                                       print(f"❌ Line {line_num}: '{line}' is invalid range — {e}", file=sys.stderr)
                                       continue
 
-                          # 2. 支持 CIDR 与单 IP 语法 (如 1.2.3.0/24 或 1.2.3.4)
                           try:
                               network = ipaddress.ip_network(line, strict=False)
                               count = network.num_addresses
@@ -308,7 +299,6 @@ jobs:
                           except ValueError as e:
                               print(f"❌ Line {line_num}: '{line}' is invalid — {e}", file=sys.stderr)
 
-              # 3. 聚合全网公开代理源 (如果开启)
               fetch_online = os.getenv("FETCH_ONLINE", "false").lower() == "true"
               if fetch_online:
                   import urllib.request
@@ -360,7 +350,6 @@ jobs:
           path: ip_list.txt
           retention-days: 1
 
-  # 阶段 3: 多机动态分片并行矩阵扫描
   scan-matrix:
     needs: [generate-matrix, expand]
     runs-on: ubuntu-latest
@@ -427,8 +416,7 @@ jobs:
           path: "results_${{ matrix.shard }}.txt"
           retention-days: 1
 
-  # 阶段 4: 结果智能汇总、协议分流与私库回传
-  merge-and-release:
+  merge-and-push:
     needs: [generate-matrix, scan-matrix]
     if: always() && needs.generate-matrix.result == 'success'
     runs-on: ubuntu-latest
@@ -455,7 +443,6 @@ jobs:
           TOTAL_LINES=$(grep -v '^\s*$' temp_merge/raw_all.txt 2>/dev/null | wc -l || echo 0)
           echo "[*] 本次扫描各分片收集到的存活记录数: $TOTAL_LINES"
 
-          # 提取本次扫描发现的各协议独立清单
           grep '^http://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_http.txt || true
           grep '^https://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_https.txt || true
           grep '^socks5://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_socks5.txt || true
@@ -526,35 +513,6 @@ jobs:
             else
               echo "[*] 代理列表无变更，跳过提交。"
             fi
-          fi
-
-      - name: Release to GitHub Releases
-        if: steps.merge.outputs.has_alive == 'true'
-        env:
-          MY_PAT: ${{ secrets.MY_PAT }}
-          PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
-          GH_TOKEN: ${{ secrets.MY_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET_REPO="${PRIVATE_REPO:-$GITHUB_REPOSITORY}"
-          RELEASE_FILES="all_results.txt"
-          [ -s http_results.txt ] && RELEASE_FILES="$RELEASE_FILES http_results.txt"
-          [ -s https_results.txt ] && RELEASE_FILES="$RELEASE_FILES https_results.txt"
-          [ -s socks5_results.txt ] && RELEASE_FILES="$RELEASE_FILES socks5_results.txt"
-          [ -s socks4_results.txt ] && RELEASE_FILES="$RELEASE_FILES socks4_results.txt"
-
-          TAG_NAME="${{ github.ref_name == 'main' && 'latest' || (github.ref_name == 'beta' && 'beta-latest' || (github.ref_name == 'test2' && 'test2-latest' || github.ref_name)) }}"
-          echo "[*] 发布 Release 到仓库: $TARGET_REPO (标签: $TAG_NAME)"
-
-          if ! gh release view "$TAG_NAME" --repo "$TARGET_REPO" >/dev/null 2>&1; then
-            echo "[*] Creating new $TAG_NAME release..."
-            gh release create "$TAG_NAME" $RELEASE_FILES \
-              --repo "$TARGET_REPO" \
-              --title "Multi-Protocol Proxy Results ($TAG_NAME)" \
-              --notes "Multi-protocol live proxies (${{ steps.merge.outputs.count }} alive). Updated at ${{ steps.date.outputs.date }}" || true
-          else
-            echo "[*] Overwriting $TAG_NAME release assets..."
-            gh release upload "$TAG_NAME" $RELEASE_FILES --repo "$TARGET_REPO" --clobber || true
-            gh release edit "$TAG_NAME" --repo "$TARGET_REPO" --title "Multi-Protocol Proxy Results ($TAG_NAME)" --notes "Multi-protocol live proxies (${{ steps.merge.outputs.count }} alive). Updated at ${{ steps.date.outputs.date }}" || true
           fi
 
       - name: Clean old workflow runs (Keep latest 1 run)
